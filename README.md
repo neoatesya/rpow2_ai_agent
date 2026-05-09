@@ -26,47 +26,65 @@ cargo run --release
 
 ---
 
-## 🖥️ Step-by-Step Guide
+## 📖 Step-by-Step Guide
 
-When you run the bot, it will ask 3 things:
+### 1. Get your magic link first
 
-### 1️⃣ Enter your email
+Before running the bot, get a login token from the website:
+
+1. Open [rpow2.com](https://rpow2.com) in your browser
+2. Click **Mine** → enter your email → complete the CAPTCHA
+3. Check your **email inbox** for the magic link
+4. **Copy the link** — looks like: `https://rpow2.com/auth/verify?token=abc123...`
+
+### 2. Run the bot
+
+```bash
+cargo run --release
+```
+
+### 3. Enter your email
+
 ```
 ▸ Enter email: your_email@gmail.com
 ```
-Use the same email you registered on [rpow2.com](https://rpow2.com).
 
-### 2️⃣ Paste the magic link
-```
-▸ Paste magic link or token: <paste from your email>
-```
-Check your inbox → copy the link or token → paste it.
+> You'll see a CAPTCHA warning — **that's normal, just ignore it.**
 
-### 3️⃣ Set number of workers
-```
-▸ Number of workers (default 2): 2
-```
-Just press **Enter** for default (2), or type a number (e.g. `4` for faster mining, uses more CPU).
-
----
-
-## ✅ Output Example
+### 4. Paste the magic link from step 1
 
 ```
-11:49:40 your_user  ⛏ mining... diff=24  workers=2  prefix=a1b2c3d4...
-11:49:41 your_user  ✓ MINTED +0.0010 RPOW  token=eeebeffa...  time=0.6s  rate=156.96 MH/s  session=1  total=0.0010
+⚠ Server requires CAPTCHA verification.
+  → Login via https://rpow2.com first, then paste the magic link from your email.
+▸ Paste magic link or token: https://rpow2.com/auth/verify?token=abc123...
+```
+
+### 5. Set number of workers
+
+```
+▸ Number of workers (default 2): 4
+```
+
+Press **Enter** for default (2) or type a number.
+
+### 6. Done! Mining starts automatically 🚀
+
+```
+11:49:40 your_user  ⛏ mining... diff=24  workers=4  prefix=a1b2c3d4...
+11:49:41 your_user  ✓ MINTED +0.0010 RPOW  token=eeebeffa...  time=0.6s  session=1  total=0.0010
 ```
 
 ---
 
 ## 💡 Tips
 
-| Tip | Detail |
-|-----|--------|
-| **Slow mining?** | Make sure you use `cargo run --release` |
-| **Rate limited?** | Check your email, the magic link was already sent |
-| **Daily cap hit?** | Max 100,000 mints per day per account, resets at UTC midnight |
-| **How much per mint?** | 0.001 RPOW per successful mint |
+| Problem | Solution |
+|---------|----------|
+| Slow mining? | Use `cargo run --release` (not `cargo run`) |
+| `TURNSTILE_REQUIRED`? | That's normal! Get token from [rpow2.com](https://rpow2.com) website first |
+| `DAILY_CAP_REACHED`? | Max 100k mints/day, resets at UTC midnight |
+| `504 error`? | Server is down, bot will auto-retry |
+| Token expired? | Get a new one from rpow2.com |
 
 ---
 

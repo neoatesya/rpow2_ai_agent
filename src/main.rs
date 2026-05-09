@@ -175,17 +175,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             email: email.clone(),
         })
         .send()
-        .await?;
+        .await;
 
-    if !res.status().is_success() && res.status().as_u16() != 429 {
-        let text = res.text().await?;
-        println!("{} {}", "✗ Failed to request auth:".bright_red(), text);
-        return Ok(());
-    } else if res.status().as_u16() == 429 {
-        println!("{}", "⚠ Rate limited, but we might still have a recent magic link!".bright_yellow());
+    match res {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            if response.status().is_success() {
+                println!("{}", "✓ Magic link sent! Check your email.".bright_green());
+            } else if status == 429 {
+                println!("{}", "⚠ Rate limited, but check your email for a recent magic link!".bright_yellow());
+            } else {
+                let text = response.text().await.unwrap_or_default();
+                if text.contains("TURNSTILE_REQUIRED") {
+                    println!("{}", "⚠ Server requires CAPTCHA verification.".bright_yellow());
+                    println!("{}", "  → Login via https://rpow2.com first, then paste the magic link from your email.".dimmed());
+                } else {
+                    println!("{} {}", "⚠ Auth request failed:".bright_yellow(), text.dimmed());
+                    println!("{}", "  → Try logging in via https://rpow2.com and paste the token from email.".dimmed());
+                }
+            }
+        }
+        Err(e) => {
+            println!("{} {}", "⚠ Could not reach auth server:".bright_yellow(), e.to_string().dimmed());
+            println!("{}", "  → Login via https://rpow2.com and paste the magic link from your email.".dimmed());
+        }
     }
 
-    println!("{}", "✓ Magic link sent! Check your email.".bright_green());
     print!("{} ", "▸ Paste magic link or token:".bright_yellow());
     io::stdout().flush()?;
     let mut magic_input = String::new();
