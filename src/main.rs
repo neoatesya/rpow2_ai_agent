@@ -228,7 +228,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let max_cores = num_cpus::get();
-    let cores = cores.min(max_cores).max(1);
+    let cores = cores.max(1);
+
+    if cores > max_cores {
+        println!(
+            "{} You have {} CPU cores but set {} workers. Performance may not scale beyond {}.",
+            "⚠ Warning:".bright_yellow().bold(),
+            max_cores,
+            cores,
+            max_cores
+        );
+    }
 
     // 4. Fetch initial account info
     println!("{}", "▸ Fetching account info...".bright_yellow());
