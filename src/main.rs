@@ -43,6 +43,14 @@ struct MintResponse {
 }
 
 #[derive(Deserialize, Debug)]
+struct CooldownResponse {
+    #[allow(dead_code)]
+    error: Option<String>,
+    message: Option<String>,
+    retry_after: Option<u64>,
+}
+
+#[derive(Deserialize, Debug)]
 struct MintToken {
     id: String,
     #[serde(default)]
@@ -164,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
         .cookie_provider(Arc::clone(&jar))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
         .build()?;
 
     // 2. Request Magic Link
@@ -333,6 +341,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "✗ SUPPLY EXHAUSTED - 21M cap reached!".bright_red().bold()
             );
             break;
+        }
+
+        // Handle cooldown (429)
+        if status_code == 429 {
+            let cooldown: CooldownResponse = challenge_res.json().await.unwrap_or(CooldownResponse {
+                error: None,
+                message: None,
+                retry_after: Some(5),
+            });
+            let wait = cooldown.retry_after.unwrap_or(5);
+            println!(
+                "{} {}  {} waiting {}s...",
+                time_str, user_display,
+                "⏳ COOLDOWN".bright_yellow(),
+                wait
+            );
+            thread::sleep(Duration::from_secs(wait));
+            continue;
         }
 
         if !challenge_res.status().is_success() {
@@ -506,7 +532,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        thread::sleep(Duration::from_millis(500));
+        // Server enforces 5s cooldown between challenges
+        thread::sleep(Duration::from_secs(5));
     }
 
     println!("\n{}", "═══════════════════════════════════════════".bright_cyan());
