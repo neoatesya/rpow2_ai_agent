@@ -1,12 +1,14 @@
 use chrono::Local;
 use colored::*;
 use num_format::{Locale, ToFormattedString};
-use reqwest::{cookie::Jar, Client};
+use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
+    fs,
     io::{self, Write},
+    path::PathBuf,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -14,6 +16,15 @@ use std::{
 
 const API_BASE: &str = "https://api.rpow2.com";
 const BASE_UNITS_PER_RPOW: f64 = 1_000_000_000.0; // 9 decimals
+const SESSION_FILE: &str = ".rpow-session.json";
+
+// ─── Data Structures ─────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SessionData {
+    email: String,
+    cookies: Vec<String>,
+}
 
 #[derive(Serialize)]
 struct AuthRequest {
@@ -46,6 +57,7 @@ struct MintResponse {
 struct CooldownResponse {
     #[allow(dead_code)]
     error: Option<String>,
+    #[allow(dead_code)]
     message: Option<String>,
     retry_after: Option<u64>,
 }
@@ -67,10 +79,14 @@ struct MeResponse {
     balance_base_units: Option<String>,
     #[allow(dead_code)]
     minted_base_units: Option<String>,
+    #[allow(dead_code)]
     daily_mint_cap_base_units: Option<String>,
+    #[allow(dead_code)]
     daily_minted_base_units: Option<String>,
     daily_remaining_base_units: Option<String>,
 }
+
+// ─── Mining Engine ───────────────────────────────────────────
 
 fn count_trailing_zero_bits(hash: &[u8]) -> u32 {
     let mut count = 0;
@@ -102,12 +118,10 @@ fn mine_challenge(nonce_prefix_hex: &str, difficulty_bits: u32, cores: usize) ->
             base_hasher.update(&prefix);
 
             loop {
-                // Check if another thread found the solution
                 if found.load(Ordering::Relaxed) {
                     return None;
                 }
 
-                // Inner loop to reduce atomic load overhead
                 for _ in 0..4096 {
                     let mut hasher = base_hasher.clone();
                     hasher.update(&nonce.to_le_bytes());
@@ -134,6 +148,74 @@ fn mine_challenge(nonce_prefix_hex: &str, difficulty_bits: u32, cores: usize) ->
     (solution, duration)
 }
 
+// ─── Session Persistence ─────────────────────────────────────
+
+fn session_path() -> PathBuf {
+    PathBuf::from(SESSION_FILE)
+}
+
+fn save_session(email: &str, cookies: &[String]) {
+    let data = SessionData {
+        email: email.to_string(),
+        cookies: cookies.to_vec(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&data) {
+        let _ = fs::write(session_path(), json);
+    }
+}
+
+fn load_session() -> Option<SessionData> {
+    let path = session_path();
+    if !path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn delete_session() {
+    let _ = fs::remove_file(session_path());
+}
+
+fn build_client_with_cookies(cookies: &[String]) -> Client {
+    let mut headers = header::HeaderMap::new();
+    let cookie_str = cookies.join("; ");
+    if let Ok(val) = header::HeaderValue::from_str(&cookie_str) {
+        headers.insert(header::COOKIE, val);
+    }
+
+    Client::builder()
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+        .build()
+        .expect("Failed to build HTTP client")
+}
+
+fn build_client_no_cookies() -> Client {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+        .build()
+        .expect("Failed to build HTTP client")
+}
+
+/// Extract Set-Cookie values from a response
+fn extract_cookies(res: &reqwest::Response) -> Vec<String> {
+    res.headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| {
+            let full = v.to_str().ok()?;
+            // Extract just "name=value" part before first ";"
+            let cookie = full.split(';').next().unwrap_or(full);
+            Some(cookie.to_string())
+        })
+        .collect()
+}
+
+// ─── Helpers ─────────────────────────────────────────────────
+
 fn format_rpow(base_units: f64) -> String {
     if base_units >= BASE_UNITS_PER_RPOW {
         format!("{:.4} RPOW", base_units / BASE_UNITS_PER_RPOW)
@@ -146,99 +228,40 @@ fn extract_username(email: &str) -> String {
     email.split('@').next().unwrap_or(email).to_string()
 }
 
+// ─── Main ────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n{}", "╔══════════════════════════════════════════════╗".bright_cyan());
-    println!("{}", "║      RPOW2 Live Mining Bot  v2.0             ║".bright_cyan());
-    println!("{}", "║      github.com/frkrueger/rpow               ║".bright_cyan());
+    println!("{}", "║      RPOW2 Live Mining Bot  v2.1             ║".bright_cyan());
+    println!("{}", "║      github.com/neoatesya/rpow2_ai_agent     ║".bright_cyan());
     println!("{}", "╚══════════════════════════════════════════════╝".bright_cyan());
     println!();
 
-    // 1. Prompt for Email
-    print!("{} ", "▸ Enter email:".bright_yellow());
-    io::stdout().flush()?;
-    let mut email_input = String::new();
-    io::stdin().read_line(&mut email_input)?;
-    let email = email_input.trim().to_string();
+    // ── Try to restore saved session ──
+    let (mut client, mut email) = if let Some(session) = load_session() {
+        println!("{} {}", "▸ Found saved session for".bright_yellow(), session.email.bright_blue());
+        let test_client = build_client_with_cookies(&session.cookies);
 
-    if email.is_empty() {
-        println!("{}", "✗ Email cannot be empty!".bright_red());
-        return Ok(());
-    }
-
-    let username = extract_username(&email);
-
-    let jar = Arc::new(Jar::default());
-    let client = Client::builder()
-        .cookie_provider(Arc::clone(&jar))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
-        .build()?;
-
-    // 2. Request Magic Link
-    println!("{} {}...", "▸ Requesting magic link for".bright_yellow(), email.bright_blue());
-    let res = client
-        .post(format!("{}/auth/request", API_BASE))
-        .json(&AuthRequest {
-            email: email.clone(),
-        })
-        .send()
-        .await;
-
-    match res {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            if response.status().is_success() {
-                println!("{}", "✓ Magic link sent! Check your email.".bright_green());
-            } else if status == 429 {
-                println!("{}", "⚠ Rate limited, but check your email for a recent magic link!".bright_yellow());
-            } else {
-                let text = response.text().await.unwrap_or_default();
-                if text.contains("TURNSTILE_REQUIRED") {
-                    println!("{}", "⚠ Server requires CAPTCHA verification.".bright_yellow());
-                    println!("{}", "  → Login via https://rpow2.com first, then paste the magic link from your email.".dimmed());
-                } else {
-                    println!("{} {}", "⚠ Auth request failed:".bright_yellow(), text.dimmed());
-                    println!("{}", "  → Try logging in via https://rpow2.com and paste the token from email.".dimmed());
-                }
+        // Test if session is still valid
+        match test_client.get(format!("{}/me", API_BASE)).send().await {
+            Ok(res) if res.status().is_success() => {
+                println!("{}", "✓ Session restored! Skipping login.".bright_green());
+                (test_client, session.email)
+            }
+            _ => {
+                println!("{}", "⚠ Saved session expired. Need to login again.".bright_yellow());
+                delete_session();
+                do_login().await?
             }
         }
-        Err(e) => {
-            println!("{} {}", "⚠ Could not reach auth server:".bright_yellow(), e.to_string().dimmed());
-            println!("{}", "  → Login via https://rpow2.com and paste the magic link from your email.".dimmed());
-        }
-    }
-
-    print!("{} ", "▸ Paste magic link or token:".bright_yellow());
-    io::stdout().flush()?;
-    let mut magic_input = String::new();
-    io::stdin().read_line(&mut magic_input)?;
-    let magic_input = magic_input.trim();
-
-    let token = if magic_input.contains("token=") {
-        magic_input.split("token=").last().unwrap_or("").to_string()
     } else {
-        magic_input.to_string()
+        do_login().await?
     };
 
-    // 3. Verify Token and get Session Cookie
-    println!("{}", "▸ Verifying token...".bright_yellow());
-    let res = client
-        .get(format!("{}/auth/verify", API_BASE))
-        .query(&[("token", &token)])
-        .send()
-        .await?;
+    let mut username = extract_username(&email);
 
-    if !res.status().is_success() && res.status().as_u16() != 302 && res.status().as_u16() != 200 {
-        println!("{} Status: {}", "✗ Failed to verify token.".bright_red(), res.status());
-        let text = res.text().await.unwrap_or_default();
-        println!("  Response: {}", text);
-        return Ok(());
-    }
-
-    println!("{}", "✓ Login successful!".bright_green());
-
-    // 3.5 Prompt for Worker Count
+    // ── Prompt for Worker Count ──
     print!("{} ", "▸ Number of workers (default 2):".bright_yellow());
     io::stdout().flush()?;
     let mut worker_input = String::new();
@@ -263,7 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // 4. Fetch initial account info
+    // ── Fetch account info ──
     println!("{}", "▸ Fetching account info...".bright_yellow());
     let mut balance_rpow: f64 = 0.0;
     let mut daily_remaining: String = "unknown".to_string();
@@ -291,7 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  {}  {:.6} RPOW", "Balance:".dimmed(), balance_rpow);
     println!("  {}  {}", "Daily Remaining:".dimmed(), daily_remaining);
     println!("  {}  {}", "Workers:".dimmed(), cores.to_string().bright_white());
-    println!("  {}  0.001 RPOW", "Reward/mint:".dimmed());
+    println!("  {}  {}", "Session:".dimmed(), session_path().display().to_string().dimmed());
     println!("{}", "─────────────────────────────────────────────".bright_cyan());
     println!();
 
@@ -299,8 +322,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut session_count: u64 = 0;
     let mut total_rpow_earned: f64 = 0.0;
+    let mut auth_fail_count: u32 = 0;
 
-    // 5. Infinite Mining Loop
+    // ── Infinite Mining Loop ──
     loop {
         let time_str = Local::now().format("%H:%M:%S").to_string().bright_green();
         let user_display = username.bright_cyan();
@@ -332,6 +356,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let status_code = challenge_res.status().as_u16();
+
+        // Handle session expired (401) — retry a few times, then re-login
+        // Server overload can cause false 401s
+        if status_code == 401 {
+            auth_fail_count += 1;
+            let body = challenge_res.text().await.unwrap_or_default();
+            if auth_fail_count >= 3 {
+                println!(
+                    "{} {}  {}",
+                    time_str, user_display,
+                    "✗ Session expired! Re-login required...".bright_yellow().bold()
+                );
+                delete_session();
+                match do_login().await {
+                    Ok((new_client, new_email)) => {
+                        client = new_client;
+                        email = new_email;
+                        username = extract_username(&email);
+                        auth_fail_count = 0;
+                        println!("{}", "✓ Re-login successful! Resuming mining...".bright_green());
+                        continue;
+                    }
+                    Err(e) => {
+                        println!("{} {}", "✗ Re-login failed:".bright_red(), e);
+                        break;
+                    }
+                }
+            } else {
+                println!(
+                    "{} {}  {} retry {}/3 in 10s... {}",
+                    time_str, user_display,
+                    "⚠ AUTH ERROR (401)".bright_yellow().bold(),
+                    auth_fail_count,
+                    body.dimmed()
+                );
+                thread::sleep(Duration::from_secs(10));
+                continue;
+            }
+        } else {
+            auth_fail_count = 0; // reset on any non-401
+        }
 
         // Handle supply exhausted
         if status_code == 410 {
@@ -442,11 +507,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref t) = body.token {
                 let token_short = if t.id.len() > 8 { &t.id[..8] } else { &t.id };
 
-                // Parse reward value from response
                 let reward_base = t.value_base_units
                     .as_ref()
                     .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(1_000_000.0); // default 0.001 RPOW
+                    .unwrap_or(1_000_000.0);
                 let reward_rpow = reward_base / BASE_UNITS_PER_RPOW;
 
                 session_count += 1;
@@ -545,3 +609,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+// ─── Login Flow ──────────────────────────────────────────────
+
+async fn do_login() -> Result<(Client, String), Box<dyn std::error::Error>> {
+    // 1. Prompt for Email
+    print!("{} ", "▸ Enter email:".bright_yellow());
+    io::stdout().flush()?;
+    let mut email_input = String::new();
+    io::stdin().read_line(&mut email_input)?;
+    let email = email_input.trim().to_string();
+
+    if email.is_empty() {
+        println!("{}", "✗ Email cannot be empty!".bright_red());
+        std::process::exit(1);
+    }
+
+    let temp_client = build_client_no_cookies();
+
+    // 2. Request Magic Link
+    println!("{} {}...", "▸ Requesting magic link for".bright_yellow(), email.bright_blue());
+    let res = temp_client
+        .post(format!("{}/auth/request", API_BASE))
+        .json(&AuthRequest {
+            email: email.clone(),
+        })
+        .send()
+        .await;
+
+    match res {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            if response.status().is_success() {
+                println!("{}", "✓ Magic link sent! Check your email.".bright_green());
+            } else if status == 429 {
+                println!("{}", "⚠ Rate limited, but check your email for a recent magic link!".bright_yellow());
+            } else {
+                let text = response.text().await.unwrap_or_default();
+                if text.contains("TURNSTILE_REQUIRED") || text.contains("BLOCKED") {
+                    println!("{}", "⚠ Server requires CAPTCHA / browser verification.".bright_yellow());
+                    println!("{}", "  → Login via https://rpow2.com first, then paste the magic link from your email.".dimmed());
+                } else {
+                    println!("{} {}", "⚠ Auth request failed:".bright_yellow(), text.dimmed());
+                    println!("{}", "  → Try logging in via https://rpow2.com and paste the token from email.".dimmed());
+                }
+            }
+        }
+        Err(e) => {
+            println!("{} {}", "⚠ Could not reach auth server:".bright_yellow(), e.to_string().dimmed());
+            println!("{}", "  → Login via https://rpow2.com and paste the magic link from your email.".dimmed());
+        }
+    }
+
+    // 3. Paste token
+    print!("{} ", "▸ Paste magic link or token:".bright_yellow());
+    io::stdout().flush()?;
+    let mut magic_input = String::new();
+    io::stdin().read_line(&mut magic_input)?;
+    let magic_input = magic_input.trim();
+
+    let token = if magic_input.contains("token=") {
+        magic_input.split("token=").last().unwrap_or("").to_string()
+    } else {
+        magic_input.to_string()
+    };
+
+    // 4. Verify Token — use no-redirect client to capture Set-Cookie from 302
+    println!("{}", "▸ Verifying token...".bright_yellow());
+
+    // Build a special client that does NOT follow redirects
+    // so we can capture Set-Cookie from the 302 response
+    let no_redirect_client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+        .build()?;
+
+    let res = no_redirect_client
+        .get(format!("{}/auth/verify", API_BASE))
+        .query(&[("token", &token)])
+        .send()
+        .await?;
+
+    let status = res.status().as_u16();
+
+    // 302 = success (redirect with cookie), 200 = also success
+    if status != 302 && status != 200 {
+        println!("{} Status: {}", "✗ Failed to verify token.".bright_red(), res.status());
+        let text = res.text().await.unwrap_or_default();
+        println!("  Response: {}", text);
+        std::process::exit(1);
+    }
+
+    // Extract cookies from the 302 response
+    let cookies = extract_cookies(&res);
+    if cookies.is_empty() {
+        println!("{}", "⚠ No session cookies received. Session won't be saved.".bright_yellow());
+    } else {
+        save_session(&email, &cookies);
+        println!(
+            "{} saved to {}",
+            "✓ Session persisted!".bright_green(),
+            SESSION_FILE.dimmed()
+        );
+    }
+
+    println!("{}", "✓ Login successful!".bright_green());
+
+    // Build client with the new cookies
+    let client = build_client_with_cookies(&cookies);
+    Ok((client, email))
+}
+
